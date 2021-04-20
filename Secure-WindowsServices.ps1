@@ -4,13 +4,18 @@
 	Description: The purpose of this script is to secure any Windows services with insecure permissions.
 
 .NOTES
-	Author:				Ben Hooper at Astrix
-	Created:			2018/10/05
-	Tested on:			Windows 7 Professional 64-bit, Windows 10 Pro 64-bit
-	Updated:			2018/10/12
-	Version:			1.2
-	Changes in v1.2:	Enhanced output by (1) changing output type from "check performed-action result" with just "action result" which makes it easier to read with less indentations, (2) adding tags ("[FAILED]", "[SUCCESS]", and "[NOTIFICATION]") for quick checking of results, and (3) tweaking logging behaviour.
-	Changes in v1.1:	Added handling of inherited permissions.
+	Author:					Ben Hooper at Astrix
+	Tested on:				Windows 7 Professional 64-bit, Windows 10 Pro 64-bit
+	Version:				1.9
+	Changes in v1.9 (2021/04/20):       Change Get-Acl returns an error. Change to (Get-Item $Path).GetAccessControl('Access'); in two places.
+    Changes in v1.8 (2020/03/06 14:08):	Added handling for Windows services where the paths don't actually exist.
+	Changes in v1.7 (2019/11/21 10:14):	Corrected "Windows service secured" logic so that it'll only report if it was actually successful in securing it.
+	Changes in v1.6 (2019/11/20 14:31):	Fixed compatibility with Windows 7 / PowerShell < 3.0.
+	Changes in v1.5 (2019/11/20 13:43):	Added special handling for Windows services located in "C:\Windows\system32\" so that the permissions are reduced to read & execute instead of being removed.
+	Changes in v1.4 (2019/11/20 12:33):	Added post-run report of which, if any, services were secured.
+	Changes in v1.3 (2019/11/20 11:39):	Updated to bring in line with enhancements of Update-hMailServerCertificate v1.13 (write access check to log file, auto-elevate, coloured statuses, etc) and changed tags to Info, Unknown, Pass, FAIL, Success, and ERROR.
+	Changes in v1.2 (2018/10/15):		Enhanced output by (1) changing output type from "check performed-action result" with just "action result" which makes it easier to read with less indentations, (2) adding tags ("[FAILED]", "[SUCCESS]", and "[NOTIFICATION]") for quick checking of results, and (3) tweaking logging behaviour.
+	Changes in v1.1 (2018/10/05):		Added handling of inherited permissions.
 	
 .PARAMETER LogOutput
 	Logs the output to the default file path "C:\<hostname>_Secure-WindowsServices.txt".
@@ -46,7 +51,13 @@ Param(
 
 $RunAsAdministrator = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator);
 
-$LogPath_Default = "C:\$env:computername`_Secure-WindowsServices.txt";
+$global:FirstRun = $null;
+$global:Script_PS1File_Name = Split-Path $MyInvocation.MyCommand.Path -Leaf;
+$global:Script_PS1File_FullPath = $MyInvocation.MyCommand.Path;
+[System.Collections.ArrayList]$global:InsecureWindowsServices = @();
+[System.Collections.ArrayList]$global:SecuredWindowsServices = @();
+
+$LogPath_Default = "C:\$env:computername`_$global:Script_PS1File_Name.log";
 
 #-----------------------------------------------------------[Functions]------------------------------------------------------------
 
@@ -54,32 +65,31 @@ Function Secure-WindowsServices {
 	Param()
 	
 	Begin {
-		Write-Output "Securing all Windows services...";
+		Write-Host "Securing all Windows services...";
 	}
 	
 	Process {
 		Try {
-			If ($AlreadyRun -Eq $Null){
-				$AlreadyRun = $False;
+			If ($FirstRun -Eq $Null){
+				$FirstRun = $False;
 			} Else {
-				$AlreadyRun = $True;
+				$FirstRun = $True;
 			}
 			
-			If ($AlreadyRun -Eq $False){
+			If ($FirstRun -Eq $False){
 				[System.Collections.ArrayList]$FilesChecked = @(); # This is critical to ensuring that the array isn't a fixed size so that items can be added;
 				[System.Collections.ArrayList]$FoldersChecked = @(); # This is critical to ensuring that the array isn't a fixed size so that items can be added;
 			}
 			
-			Write-Output "";
+			$WindowsServices = Get-WmiObject Win32_Service -ErrorAction Stop | Select Name, DisplayName, PathName | Sort-Object DisplayName;
 			
-			Write-Output "`t Searching for Windows services...";
+			If (-Not ($WindowsServices)) {
+				Write-Host -ForegroundColor Red "`t[ERROR] Could not find any Windows services. Exiting...";
+				
+				Break;
+			}
 			
-			$WindowsServices = Get-WmiObject Win32_Service | Select Name, DisplayName, PathName | Sort-Object DisplayName;
 			$WindowsServices_Total = $WindowsServices.Length;
-			
-			Write-Output "`t`t $WindowsServices_Total Windows services found.";
-			
-			Write-Output "";
 			
 			For ($i = 0; $i -LT $WindowsServices_Total; $i++) {
 				$Count = $i + 1;
@@ -89,34 +99,42 @@ Function Secure-WindowsServices {
 				$WindowsService_File_Path = ($WindowsService_Path -Replace '(.+exe).*', '$1').Trim('"');
 				$WindowsService_Folder_Path = Split-Path -Parent $WindowsService_File_Path;
 				
-				Write-Output "`t Windows service ""$WindowsService_DisplayName"" ($Count of $WindowsServices_Total)...";
+				Write-Host "`tWindows service ""$WindowsService_DisplayName"" ($Count of $WindowsServices_Total)...";
 				
 				If ($FoldersChecked -Contains $WindowsService_Folder_Path){
-					Write-Output "`t`t Folder ""$WindowsService_Folder_Path"": Security has already been ensured.";
-					Write-Output "";
+					Write-Host -ForegroundColor Green "`t`t[Pass] Folder ""$WindowsService_Folder_Path"": Security has already been ensured.";
 				} Else {
 					$FoldersChecked += $WindowsService_Folder_Path;
 					
-					Write-Output "`t`t Folder ""$WindowsService_Folder_Path"": Security has not yet been ensured.";
-					
-					Correct-InsecurePermissions -Path $WindowsService_Folder_Path;
+					If (Test-Path $WindowsService_Folder_Path) {
+						Write-Host -ForegroundColor Yellow "`t`t[Unknown] Folder ""$WindowsService_Folder_Path"": Security has not yet been ensured...";
+						
+						Ensure-InsecurePermissions -Path $WindowsService_Folder_Path -WindowsService $WindowsService_DisplayName;
+					} Else {
+						Write-Host -ForegroundColor Green "`t`t[Pass] Folder ""$WindowsService_Folder_Path"": Ignoring as doesn't actually exist.";
+					}
 				}
 				
 				If ($FilesChecked -Contains $WindowsService_File_Path){
-					Write-Output "`t`t File ""$WindowsService_File_Path"": Security has already been ensured.";
-					Write-Output "";
+					Write-Host -ForegroundColor Green "`t`t[Pass] File ""$WindowsService_File_Path"": Security has already been ensured.";
 				} Else {
 					$FilesChecked += $WindowsService_File_Path;
 					
-					Write-Output "`t`t File ""$WindowsService_File_Path"": Security has not yet been ensured.";
-					
-					Correct-InsecurePermissions -Path $WindowsService_File_Path;
+					If (Test-Path $WindowsService_File_Path) {
+						Write-Host -ForegroundColor Yellow "`t`t[Unknown] File ""$WindowsService_File_Path"": Security has not yet been ensured...";
+						
+						Ensure-InsecurePermissions -Path $WindowsService_File_Path -WindowsService $WindowsService_DisplayName;
+					} Else {
+						Write-Host -ForegroundColor Green "`t`t[Pass] File ""$WindowsService_File_Path"": Ignoring as doesn't actually exist.";
+					}
 				}
+				
+				Write-Host "";
 			}
 		}
 		
 		Catch {
-			Write-Output "...FAILURE securing all Windows services.";
+			Write-Host -ForegroundColor Red "[ERROR] Could not secure all Windows services.";
 			$_.Exception.Message;
 			$_.Exception.ItemName;
 			Break;
@@ -125,14 +143,38 @@ Function Secure-WindowsServices {
 	
 	End {
 		If($?){
-			Write-Output "...Success securing all Windows services.";
+			$SecuredWindowsServices_Total = $global:SecuredWindowsServices.Count;
+			$InsecureWindowsServices_Total = $global:InsecureWindowsServices.Count;
+			
+			If ($SecuredWindowsServices_Total -Eq $InsecureWindowsServices_Total){
+				If ($SecuredWindowsServices_Total -Eq 0){
+					Write-Host -ForegroundColor Green "[Pass] All Windows services were already secure.";
+				} Else {
+					If ($SecuredWindowsServices_Total -Eq 1){
+						Write-Host -ForegroundColor Green "[Success] The sole insecure Windows service was secured:";
+					} Else {
+						Write-Host -ForegroundColor Green "[Success] All $SecuredWindowsServices_Total insecure Windows services were secured:";
+					}
+					
+					For ($i = 0; $i -LT $SecuredWindowsServices_Total; $i++) {
+						$Count = $i + 1;
+						
+						$SecuredWindowsServices_DisplayName = $global:SecuredWindowsServices[$i];
+						
+						Write-Host "`t$Count. ""$SecuredWindowsServices_DisplayName""";
+					}
+				}
+			} Else {
+				Write-Host -ForegroundColor Red "[ERROR] Not all Windows services could be secured. Please review the log.";
+			}
 		}
 	}
 }
 
-Function Correct-InsecurePermissions {
+Function Ensure-InsecurePermissions {
 	Param(
-		[Parameter(Mandatory=$true)][String]$Path
+		[Parameter(Mandatory=$true)][String]$Path,
+		[Parameter(Mandatory=$true)][String]$WindowsService
 	)
 	
 	Begin {
@@ -141,7 +183,7 @@ Function Correct-InsecurePermissions {
 	
 	Process {
 		Try {
-			$ACL = Get-ACL $Path;
+			$ACL = (Get-Item $Path).GetAccessControl('Access') ;
 			$ACL_Access = $ACL | Select -Expand Access;
 			
 			$InsecurePermissionsFound = $False;
@@ -154,8 +196,11 @@ Function Correct-InsecurePermissions {
 				ForEach ($Permission in $Permissions){
 					If ((($Permission -Eq "FullControl") -Or ($Permission -Eq "Modify") -Or ($Permission -Eq "Write")) -And (($SecurityPrincipal -Eq "Everyone") -Or ($SecurityPrincipal -Eq "NT AUTHORITY\Authenticated Users") -Or ($SecurityPrincipal -Eq "BUILTIN\Users") -Or ($SecurityPrincipal -Eq "$Env:USERDOMAIN\Domain Users"))) {
 						$InsecurePermissionsFound = $True;
+						$WindowsServiceSecured = $False;
 						
-						Write-Output "`t`t`t [WARNING] Insecure permissions found: ""$Permission"" granted to ""$SecurityPrincipal"".";
+						$global:InsecureWindowsServices += $WindowsService;
+						
+						Write-Host -ForegroundColor Yellow "`t`t`t[WARNING] Insecure Access Control Entry (ACE) found: ""$Permission"" granted to ""$SecurityPrincipal"".";
 						
 						If ($Inheritance -Eq $True){
 							$Error.Clear();
@@ -163,45 +208,58 @@ Function Correct-InsecurePermissions {
 								$ACL.SetAccessRuleProtection($True,$True);
 								Set-Acl -Path $Path -AclObject $ACL;
 							} Catch {
-								Write-Output "`t`t`t`t [FAILURE] Could not convert permissions from inherited to explicit.";
+								Write-Host -ForegroundColor Red "`t`t`t`t[FAIL] Could not convert Access Control List (ACL) from inherited to explicit.";
 							}
 							If (!$error){
-								Write-Output "`t`t`t`t [SUCCESS] Converted permissions from inherited to explicit.";
+								Write-Host -ForegroundColor Green "`t`t`t`t[Success] Converted Access Control List (ACL) from inherited to explicit.";
 							}
 							
 							# Once permission inheritance has been disabled, the permissions need to be re-acquired in order to remove ACEs
-							$ACL = Get-ACL $Path;
-						} Else {
-							Write-Output "`t`t`t`t [NOTIFICATION] Permissions not inherited.";
+							$ACL = (Get-Item $Path).GetAccessControl('Access');
 						}
-						
-						Write-Output "";
 						
 						$Error.Clear();
-						Try {
-							$ACE_New = New-Object System.Security.AccessControl.FileSystemAccessRule($SecurityPrincipal, $Permission, , , "Allow");
-							$ACL.RemoveAccessRuleAll($ACE_New);
-							Set-Acl -Path $Path -AclObject $ACL;
-						} Catch {
-							Write-Output "`t`t`t`t [FAILURE] Insecure permissions could not be removed.";
-						}
-						If (!$error){
-							Write-Output "`t`t`t`t [SUCCESS] Removed insecure permissions.";
+						If ((($Path -Eq "C:\Windows\system32\svchost.exe") -Or ($Path -Eq "C:\Windows\system32")) -And ($SecurityPrincipal -Eq "BUILTIN\Users")) {
+							Write-Host "`t`t`t`t[Info] Windows service is a default located in a system location so Access Control Entry (ACE) for ""BUILTIN\Users"" should be read & execute.";
+							Try {
+								$ACE = New-Object System.Security.AccessControl.FileSystemAccessRule($SecurityPrincipal, "ReadAndExecute", , , "Allow");
+								$ACL.SetAccessRule($ACE);
+								Set-Acl -Path $Path -AclObject $ACL;
+							} Catch {
+								Write-Host -ForegroundColor Red "`t`t`t`t[FAIL] Insecure Access Control Entry (ACE) could not be corrected.";
+							}
+							If (!$error){
+								$WindowsServiceSecured = $True;
+								Write-Host -ForegroundColor Green "`t`t`t`t[Pass] Corrected insecure Access Control Entry (ACE).";
+							}
+						} Else {
+							Try {
+								$ACE = New-Object System.Security.AccessControl.FileSystemAccessRule($SecurityPrincipal, $Permission, , , "Allow");
+								$ACL.RemoveAccessRuleAll($ACE);
+								Set-Acl -Path $Path -AclObject $ACL;
+							} Catch {
+								Write-Host -ForegroundColor Red "`t`t`t`t[FAIL] Insecure Access Control Entry (ACE) could not be removed.";
+							}
+							If (!$error){
+								$WindowsServiceSecured = $True;
+								Write-Host -ForegroundColor Green "`t`t`t`t[Pass] Removed insecure Access Control Entry (ACE).";
+							}
 						}
 						
-						Write-Output "";
+						If (($WindowsServiceSecured -Eq $True) -And (-Not ($global:SecuredWindowsServices -Contains $WindowsService))){
+							$global:SecuredWindowsServices += $WindowsService;
+						}						
 					}
 				}
 			}
 			
 			If ($InsecurePermissionsFound -Eq $False) {
-				Write-Output "`t`t`t [NOTIFICATION] No insecure permissions found.";
-				Write-Output "";
+				Write-Host -ForegroundColor Green "`t`t`t[Pass] No insecure Access Control Entries (ACEs) found.";
 			}
 		}
 		
 		Catch {
-			Write-Output "`t`t`t ...FAILURE.";
+			Write-Host -ForegroundColor Red "`t`t`t[ERROR] Could not ensure security of Windows service.";
 			$_.Exception.Message;
 			$_.Exception.ItemName;
 			Break;
@@ -217,154 +275,288 @@ Function Correct-InsecurePermissions {
 
 #-----------------------------------------------------------[Execution]------------------------------------------------------------
 
-If ($LogOutput -Eq $True) {
-	If (-Not $LogPath) {
-		$LogPath = $LogPath_Default;
-	}
-	Start-Transcript -Path $LogPath -Append | Out-Null;
-	
-	Write-Output "Logging output to file ""$LogPath""...";
-	
-	Write-Output "";
+If (-Not $LogPath) {
+	$LogPath = $LogPath_Default;
 }
 
-Write-Output "Administrative permissions required. Checking...";
+# Check write access to log file
+If ($LogOutput -Eq $True) {
+	Try {
+		[io.file]::OpenWrite($LogPath).Close();
+	}
+	Catch {
+		Write-Host -ForegroundColor Red "[ERROR] Unable to log output to file '$LogPath' due to insufficient permissions.";
+		Write-Host "";
+		
+		$LogOutput = $False;
+	}
+}
+
+# Set up logging
+If ($LogOutput -Eq $True) {
+	Start-Transcript -Path $LogPath -Append | Out-Null;
+	
+	Write-Host "Logging output to file.";
+	Write-Host "Path: '$LogPath'" 
+	
+	Write-Host "";
+	Write-Host "----------------------------------------------------------------";
+	Write-Host "";
+}
+
+# Handle admin
 If ($RunAsAdministrator -Eq $False) {
-	Write-Output "`t This script was not run as administrator. Exiting...";
-	
-	Break;
-} ElseIf ($RunAsAdministrator -Eq $True) {
-	Write-Output "`t This script was run as administrator. Proceeding...";
-	
-	Write-Output "";
-	Write-Output "----------------------------------------------------------------";
-	Write-Output "";
-	
+	Write-Host "This script requires administrative permissions but was not run as administrator. Elevate now? (y/n)";
+	$Elevate = Read-Host "[Input]";
+
+	If (($Elevate -Like "y") -Or ($Elevate -Like "yes")){
+		Write-Host "'Yes' selected. Launching a new session in a new window and ending this session...";
+		
+		# Preserve original parameters
+		$AllParameters_String = "";
+		ForEach ($Parameter in $PsBoundParameters.GetEnumerator()){
+			$Parameter_Key = $Parameter.Key;
+			$Parameter_Value = $Parameter.Value;
+			$Parameter_Value_Type = $Parameter_Value.GetType().Name;
+			
+			If ($Parameter_Value_Type -Eq "SwitchParameter"){
+				$AllParameters_String += " -$Parameter_Key";
+				
+			} ElseIf ($Parameter_Value_Type -Eq "String") {
+				$AllParameters_String += ' -' + $Parameter_Key + ' "' + $Parameter_Value + '"';
+			} Else {
+				$AllParameters_String += " -$Parameter_Key $Parameter_Value";
+			}
+		}
+		
+		$Arguments = ' -NoExit -File "' + $global:Script_PS1File_FullPath + '"' + $AllParameters_String;
+		
+		If ($LogOutput -Eq $True) {
+			Stop-Transcript | Out-Null;
+		}
+		
+		Start-Process -FilePath PowerShell.exe -Verb Runas -ArgumentList $Arguments;
+		
+		# Stop-Process -Id $PID;
+		
+		Break;
+	} Else {
+		Write-Host "'No' selected. Exiting...";
+		
+		If ($LogOutput -Eq $True) {
+			Stop-Transcript | Out-Null;
+		}
+		
+		Break;
+	}
+} Else {
 	Secure-WindowsServices;
 }
 
-Write-Output "";
-Write-Output "----------------------------------------------------------------";
-Write-Output "";
+Write-Host "";
+Write-Host "----------------------------------------------------------------";
+Write-Host "";
 
-Write-Output "Script complete. Exiting...";
+Write-Host "Script complete.";
 
 If ($LogOutput -Eq $True) {
 	Stop-Transcript | Out-Null;
 }
 # SIG # Begin signature block
-# MIIVMAYJKoZIhvcNAQcCoIIVITCCFR0CAQExCzAJBgUrDgMCGgUAMGkGCisGAQQB
-# gjcCAQSgWzBZMDQGCisGAQQBgjcCAR4wJgIDAQAABBAfzDtgWUsITrck0sYpfvNR
-# AgEAAgEAAgEAAgEAAgEAMCEwCQYFKw4DAhoFAAQU1tl1cLIG54equwKlskV5mA7L
-# IeugghAfMIIEmTCCA4GgAwIBAgIPFojwOSVeY45pFDkH5jMLMA0GCSqGSIb3DQEB
-# BQUAMIGVMQswCQYDVQQGEwJVUzELMAkGA1UECBMCVVQxFzAVBgNVBAcTDlNhbHQg
-# TGFrZSBDaXR5MR4wHAYDVQQKExVUaGUgVVNFUlRSVVNUIE5ldHdvcmsxITAfBgNV
-# BAsTGGh0dHA6Ly93d3cudXNlcnRydXN0LmNvbTEdMBsGA1UEAxMUVVROLVVTRVJG
-# aXJzdC1PYmplY3QwHhcNMTUxMjMxMDAwMDAwWhcNMTkwNzA5MTg0MDM2WjCBhDEL
-# MAkGA1UEBhMCR0IxGzAZBgNVBAgTEkdyZWF0ZXIgTWFuY2hlc3RlcjEQMA4GA1UE
-# BxMHU2FsZm9yZDEaMBgGA1UEChMRQ09NT0RPIENBIExpbWl0ZWQxKjAoBgNVBAMT
-# IUNPTU9ETyBTSEEtMSBUaW1lIFN0YW1waW5nIFNpZ25lcjCCASIwDQYJKoZIhvcN
-# AQEBBQADggEPADCCAQoCggEBAOnpPd/XNwjJHjiyUlNCbSLxscQGBGue/YJ0UEN9
-# xqC7H075AnEmse9D2IOMSPznD5d6muuc3qajDjscRBh1jnilF2n+SRik4rtcTv6O
-# KlR6UPDV9syR55l51955lNeWM/4Og74iv2MWLKPdKBuvPavql9LxvwQQ5z1IRf0f
-# aGXBf1mZacAiMQxibqdcZQEhsGPEIhgn7ub80gA9Ry6ouIZWXQTcExclbhzfRA8V
-# zbfbpVd2Qm8AaIKZ0uPB3vCLlFdM7AiQIiHOIiuYDELmQpOUmJPv/QbZP7xbm1Q8
-# ILHuatZHesWrgOkwmt7xpD9VTQoJNIp1KdJprZcPUL/4ygkCAwEAAaOB9DCB8TAf
-# BgNVHSMEGDAWgBTa7WR0FJwUPKvdmam9WyhNizzJ2DAdBgNVHQ4EFgQUjmstM2v0
-# M6eTsxOapeAK9xI1aogwDgYDVR0PAQH/BAQDAgbAMAwGA1UdEwEB/wQCMAAwFgYD
-# VR0lAQH/BAwwCgYIKwYBBQUHAwgwQgYDVR0fBDswOTA3oDWgM4YxaHR0cDovL2Ny
-# bC51c2VydHJ1c3QuY29tL1VUTi1VU0VSRmlyc3QtT2JqZWN0LmNybDA1BggrBgEF
-# BQcBAQQpMCcwJQYIKwYBBQUHMAGGGWh0dHA6Ly9vY3NwLnVzZXJ0cnVzdC5jb20w
-# DQYJKoZIhvcNAQEFBQADggEBALozJEBAjHzbWJ+zYJiy9cAx/usfblD2CuDk5oGt
-# Joei3/2z2vRz8wD7KRuJGxU+22tSkyvErDmB1zxnV5o5NuAoCJrjOU+biQl/e8Vh
-# f1mJMiUKaq4aPvCiJ6i2w7iH9xYESEE9XNjsn00gMQTZZaHtzWkHUxY93TYCCojr
-# QOUGMAu4Fkvc77xVCf/GPhIudrPczkLv+XZX4bcKBUCYWJpdcRaTcYxlgepv84n3
-# +3OttOe/2Y5vqgtPJfO44dXddZhogfiqwNGAwsTEOYnB9smebNd0+dmX+E/CmgrN
-# Xo/4GengpZ/E8JIh5i15Jcki+cPwOoRXrToW9GOUEB1d0MYwggWaMIIEgqADAgEC
-# AhEA5+9O8chDX2TZpbrTK3TN+zANBgkqhkiG9w0BAQsFADB9MQswCQYDVQQGEwJH
-# QjEbMBkGA1UECBMSR3JlYXRlciBNYW5jaGVzdGVyMRAwDgYDVQQHEwdTYWxmb3Jk
-# MRowGAYDVQQKExFDT01PRE8gQ0EgTGltaXRlZDEjMCEGA1UEAxMaQ09NT0RPIFJT
-# QSBDb2RlIFNpZ25pbmcgQ0EwHhcNMTgwOTI1MDAwMDAwWhcNMTkwOTI1MjM1OTU5
-# WjCB3jELMAkGA1UEBhMCR0IxETAPBgNVBBEMCENGNDUgNFNOMRowGAYDVQQIDBFS
-# aG9uZGRhIEN5bm9uIFRhZjESMBAGA1UEBwwJQWJlcmN5bm9uMScwJQYDVQQJDB5W
-# ZW50dXJlIEhvdXNlLCBOYXZpZ2F0aW9uIFBhcmsxKjAoBgNVBAoMIUFzdHJpeCBJ
-# bnRlZ3JhdGVkIFN5c3RlbXMgTGltaXRlZDELMAkGA1UECwwCSVQxKjAoBgNVBAMM
+# MIIkjwYJKoZIhvcNAQcCoIIkgDCCJHwCAQExDzANBglghkgBZQMEAgEFADB5Bgor
+# BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCAefHTRIN6cTLQJ
+# Ejc3x8q188og7nR4jMJdLGgBAM+8L6CCH3YwggSEMIIDbKADAgECAhBCGvKUCYQZ
+# H1IKS8YkJqdLMA0GCSqGSIb3DQEBBQUAMG8xCzAJBgNVBAYTAlNFMRQwEgYDVQQK
+# EwtBZGRUcnVzdCBBQjEmMCQGA1UECxMdQWRkVHJ1c3QgRXh0ZXJuYWwgVFRQIE5l
+# dHdvcmsxIjAgBgNVBAMTGUFkZFRydXN0IEV4dGVybmFsIENBIFJvb3QwHhcNMDUw
+# NjA3MDgwOTEwWhcNMjAwNTMwMTA0ODM4WjCBlTELMAkGA1UEBhMCVVMxCzAJBgNV
+# BAgTAlVUMRcwFQYDVQQHEw5TYWx0IExha2UgQ2l0eTEeMBwGA1UEChMVVGhlIFVT
+# RVJUUlVTVCBOZXR3b3JrMSEwHwYDVQQLExhodHRwOi8vd3d3LnVzZXJ0cnVzdC5j
+# b20xHTAbBgNVBAMTFFVUTi1VU0VSRmlyc3QtT2JqZWN0MIIBIjANBgkqhkiG9w0B
+# AQEFAAOCAQ8AMIIBCgKCAQEAzqqBP6OjYXiqMQBVlRGeJw8fHN86m4JoMMBKYR3x
+# Lw76vnn3pSPvVVGWhM3b47luPjHYCiBnx/TZv5TrRwQ+As4qol2HBAn2MJ0Yipey
+# qhz8QdKhNsv7PZG659lwNfrk55DDm6Ob0zz1Epl3sbcJ4GjmHLjzlGOIamr+C3bJ
+# vvQi5Ge5qxped8GFB90NbL/uBsd3akGepw/X++6UF7f8hb6kq8QcMd3XttHk8O/f
+# Fo+yUpPXodSJoQcuv+EBEkIeGuHYlTTbZHko/7ouEcLl6FuSSPtHC8Js2q0yg0Hz
+# peVBcP1lkG36+lHE+b2WKxkELNNtp9zwf2+DZeJqq4eGdQIDAQABo4H0MIHxMB8G
+# A1UdIwQYMBaAFK29mHo0tCb3+sQmVO8DveAky1QaMB0GA1UdDgQWBBTa7WR0FJwU
+# PKvdmam9WyhNizzJ2DAOBgNVHQ8BAf8EBAMCAQYwDwYDVR0TAQH/BAUwAwEB/zAR
+# BgNVHSAECjAIMAYGBFUdIAAwRAYDVR0fBD0wOzA5oDegNYYzaHR0cDovL2NybC51
+# c2VydHJ1c3QuY29tL0FkZFRydXN0RXh0ZXJuYWxDQVJvb3QuY3JsMDUGCCsGAQUF
+# BwEBBCkwJzAlBggrBgEFBQcwAYYZaHR0cDovL29jc3AudXNlcnRydXN0LmNvbTAN
+# BgkqhkiG9w0BAQUFAAOCAQEATUIvpsGK6weAkFhGjPgZOWYqPFosbc/U2YdVjXkL
+# Eoh7QI/Vx/hLjVUWY623V9w7K73TwU8eA4dLRJvj4kBFJvMmSStqhPFUetRC2vzT
+# artmfsqe6um73AfHw5JOgzyBSZ+S1TIJ6kkuoRFxmjbSxU5otssOGyUWr2zeXXbY
+# H3KxkyaGF9sY3q9F6d/7mK8UGO2kXvaJlEXwVQRK3f8n3QZKQPa0vPHkD5kCu/1d
+# Di4owb47Xxo/lxCEvBY+2KOcYx1my1xf2j7zDwoJNSLb28A/APnmDV1n0f2gHgMr
+# 2UD3vsyHZlSApqO49Rli1dImsZgm7prLRKdFWoGVFRr1UTCCBOYwggPOoAMCAQIC
+# EGJcTZCM1UL7qy6lcz/xVBkwDQYJKoZIhvcNAQEFBQAwgZUxCzAJBgNVBAYTAlVT
+# MQswCQYDVQQIEwJVVDEXMBUGA1UEBxMOU2FsdCBMYWtlIENpdHkxHjAcBgNVBAoT
+# FVRoZSBVU0VSVFJVU1QgTmV0d29yazEhMB8GA1UECxMYaHR0cDovL3d3dy51c2Vy
+# dHJ1c3QuY29tMR0wGwYDVQQDExRVVE4tVVNFUkZpcnN0LU9iamVjdDAeFw0xMTA0
+# MjcwMDAwMDBaFw0yMDA1MzAxMDQ4MzhaMHoxCzAJBgNVBAYTAkdCMRswGQYDVQQI
+# ExJHcmVhdGVyIE1hbmNoZXN0ZXIxEDAOBgNVBAcTB1NhbGZvcmQxGjAYBgNVBAoT
+# EUNPTU9ETyBDQSBMaW1pdGVkMSAwHgYDVQQDExdDT01PRE8gVGltZSBTdGFtcGlu
+# ZyBDQTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAKqC8YSpW9hxtdJd
+# K+30EyAM+Zvp0Y90Xm7u6ylI2Mi+LOsKYWDMvZKNfN10uwqeaE6qdSRzJ6438xqC
+# pW24yAlGTH6hg+niA2CkIRAnQJpZ4W2vPoKvIWlZbWPMzrH2Fpp5g5c6HQyvyX3R
+# TtjDRqGlmKpgzlXUEhHzOwtsxoi6lS7voEZFOXys6eOt6FeXX/77wgmN/o6apT9Z
+# RvzHLV2Eh/BvWCbD8EL8Vd5lvmc4Y7MRsaEl7ambvkjfTHfAqhkLtv1Kjyx5VbH+
+# WVpabVWLHEP2sVVyKYlNQD++f0kBXTybXAj7yuJ1FQWTnQhi/7oN26r4tb8QMspy
+# 6ggmzRkCAwEAAaOCAUowggFGMB8GA1UdIwQYMBaAFNrtZHQUnBQ8q92Zqb1bKE2L
+# PMnYMB0GA1UdDgQWBBRkIoa2SonJBA/QBFiSK7NuPR4nbDAOBgNVHQ8BAf8EBAMC
+# AQYwEgYDVR0TAQH/BAgwBgEB/wIBADATBgNVHSUEDDAKBggrBgEFBQcDCDARBgNV
+# HSAECjAIMAYGBFUdIAAwQgYDVR0fBDswOTA3oDWgM4YxaHR0cDovL2NybC51c2Vy
+# dHJ1c3QuY29tL1VUTi1VU0VSRmlyc3QtT2JqZWN0LmNybDB0BggrBgEFBQcBAQRo
+# MGYwPQYIKwYBBQUHMAKGMWh0dHA6Ly9jcnQudXNlcnRydXN0LmNvbS9VVE5BZGRU
+# cnVzdE9iamVjdF9DQS5jcnQwJQYIKwYBBQUHMAGGGWh0dHA6Ly9vY3NwLnVzZXJ0
+# cnVzdC5jb20wDQYJKoZIhvcNAQEFBQADggEBABHJPeEF6DtlrMl0MQO32oM4xpK6
+# /c3422ObfR6QpJjI2VhoNLXwCyFTnllG/WOF3/5HqnDkP14IlShfFPH9Iq5w5Lfx
+# sLZWn7FnuGiDXqhg25g59txJXhOnkGdL427n6/BDx9Avff+WWqcD1ptUoCPTpcKg
+# jvlP0bIGIf4hXSeMoK/ZsFLu/Mjtt5zxySY41qUy7UiXlF494D01tLDJWK/HWP9i
+# dBaSZEHayqjriwO9wU6uH5EyuOEkO3vtFGgJhpYoyTvJbCjCJWn1SmGt4Cf4U6d1
+# FbBRMbDxQf8+WiYeYH7i42o5msTq7j/mshM/VQMETQuQctTr+7yHkFGyOBkwggT+
+# MIID5qADAgECAhArc9t0YxFMWlsySvIwV3JJMA0GCSqGSIb3DQEBBQUAMHoxCzAJ
+# BgNVBAYTAkdCMRswGQYDVQQIExJHcmVhdGVyIE1hbmNoZXN0ZXIxEDAOBgNVBAcT
+# B1NhbGZvcmQxGjAYBgNVBAoTEUNPTU9ETyBDQSBMaW1pdGVkMSAwHgYDVQQDExdD
+# T01PRE8gVGltZSBTdGFtcGluZyBDQTAeFw0xOTA1MDIwMDAwMDBaFw0yMDA1MzAx
+# MDQ4MzhaMIGDMQswCQYDVQQGEwJHQjEbMBkGA1UECAwSR3JlYXRlciBNYW5jaGVz
+# dGVyMRAwDgYDVQQHDAdTYWxmb3JkMRgwFgYDVQQKDA9TZWN0aWdvIExpbWl0ZWQx
+# KzApBgNVBAMMIlNlY3RpZ28gU0hBLTEgVGltZSBTdGFtcGluZyBTaWduZXIwggEi
+# MA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQC/UjaCOtx0Nw141X8WUBlm7boa
+# mdFjOJoMZrJA26eAUL9pLjYvCmc/QKFKimM1m9AZzHSqFxmRK7VVIBn7wBo6bco5
+# m4LyupWhGtg0x7iJe3CIcFFmaex3/saUcnrPJYHtNIKa3wgVNzG0ba4cvxjVDc/+
+# teHE+7FHcen67mOR7PHszlkEEXyuC2BT6irzvi8CD9BMXTETLx5pD4WbRZbCjRKL
+# Z64fr2mrBpaBAN+RfJUc5p4ZZN92yGBEL0njj39gakU5E0Qhpbr7kfpBQO1NArRL
+# f9/i4D24qvMa2EGDj38z7UEG4n2eP1OEjSja3XbGvfeOHjjNwMtgJAPeekyrAgMB
+# AAGjggF0MIIBcDAfBgNVHSMEGDAWgBRkIoa2SonJBA/QBFiSK7NuPR4nbDAdBgNV
+# HQ4EFgQUru7ZYLpe9SwBEv2OjbJVcjVGb/EwDgYDVR0PAQH/BAQDAgbAMAwGA1Ud
+# EwEB/wQCMAAwFgYDVR0lAQH/BAwwCgYIKwYBBQUHAwgwQAYDVR0gBDkwNzA1Bgwr
+# BgEEAbIxAQIBAwgwJTAjBggrBgEFBQcCARYXaHR0cHM6Ly9zZWN0aWdvLmNvbS9D
+# UFMwQgYDVR0fBDswOTA3oDWgM4YxaHR0cDovL2NybC5zZWN0aWdvLmNvbS9DT01P
+# RE9UaW1lU3RhbXBpbmdDQV8yLmNybDByBggrBgEFBQcBAQRmMGQwPQYIKwYBBQUH
+# MAKGMWh0dHA6Ly9jcnQuc2VjdGlnby5jb20vQ09NT0RPVGltZVN0YW1waW5nQ0Ff
+# Mi5jcnQwIwYIKwYBBQUHMAGGF2h0dHA6Ly9vY3NwLnNlY3RpZ28uY29tMA0GCSqG
+# SIb3DQEBBQUAA4IBAQB6f6lK0rCkHB0NnS1cxq5a3Y9FHfCeXJD2Xqxw/tPZzeQZ
+# pApDdWBqg6TDmYQgMbrW/kzPE/gQ91QJfurc0i551wdMVLe1yZ2y8PIeJBTQnMfI
+# Z6oLYre08Qbk5+QhSxkymTS5GWF3CjOQZ2zAiEqS9aFDAfOuom/Jlb2WOPeD9618
+# KB/zON+OIchxaFMty66q4jAXgyIpGLXhjInrbvh+OLuQT7lfBzQSa5fV5juRvgAX
+# IW7ibfxSee+BJbrPE9D73SvNgbZXiU7w3fMLSjTKhf8IuZZf6xET4OHFA61XHOFd
+# kga+G8g8P6Ugn2nQacHFwsk+58Vy9+obluKUr4YuMIIFdzCCBF+gAwIBAgIQE+oo
+# cFv07O0MNmMJgGFDNjANBgkqhkiG9w0BAQwFADBvMQswCQYDVQQGEwJTRTEUMBIG
+# A1UEChMLQWRkVHJ1c3QgQUIxJjAkBgNVBAsTHUFkZFRydXN0IEV4dGVybmFsIFRU
+# UCBOZXR3b3JrMSIwIAYDVQQDExlBZGRUcnVzdCBFeHRlcm5hbCBDQSBSb290MB4X
+# DTAwMDUzMDEwNDgzOFoXDTIwMDUzMDEwNDgzOFowgYgxCzAJBgNVBAYTAlVTMRMw
+# EQYDVQQIEwpOZXcgSmVyc2V5MRQwEgYDVQQHEwtKZXJzZXkgQ2l0eTEeMBwGA1UE
+# ChMVVGhlIFVTRVJUUlVTVCBOZXR3b3JrMS4wLAYDVQQDEyVVU0VSVHJ1c3QgUlNB
+# IENlcnRpZmljYXRpb24gQXV0aG9yaXR5MIICIjANBgkqhkiG9w0BAQEFAAOCAg8A
+# MIICCgKCAgEAgBJlFzYOw9sIs9CsVw127c0n00ytUINh4qogTQktZAnczomfzD2p
+# 7PbPwdzx07HWezcoEStH2jnGvDoZtF+mvX2do2NCtnbyqTsrkfjib9DsFiCQCT7i
+# 6HTJGLSR1GJk23+jBvGIGGqQIjy8/hPwhxR79uQfjtTkUcYRZ0YIUcuGFFQ/vDP+
+# fmyc/xadGL1RjjWmp2bIcmfbIWax1Jt4A8BQOujM8Ny8nkz+rwWWNR9XWrf/zvk9
+# tyy29lTdyOcSOk2uTIq3XJq0tyA9yn8iNK5+O2hmAUTnAU5GU5szYPeUvlM3kHND
+# 8zLDU+/bqv50TmnHa4xgk97Exwzf4TKuzJM7UXiVZ4vuPVb+DNBpDxsP8yUmazNt
+# 925H+nND5X4OpWaxKXwyhGNVicQNwZNUMBkTrNN9N6frXTpsNVzbQdcS2qlJC9/Y
+# gIoJk2KOtWbPJYjNhLixP6Q5D9kCnusSTJV882sFqV4Wg8y4Z+LoE53MW4LTTLPt
+# W//e5XOsIzstAL81VXQJSdhJWBp/kjbmUZIO8yZ9HE0XvMnsQybQv0FfQKlERPSZ
+# 51eHnlAfV1SoPv10Yy+xUGUJ5lhCLkMaTLTwJUdZ+gQek9QmRkpQgbLevni3/GcV
+# 4clXhB4PY9bpYrrWX1Uu6lzGKAgEJTm4Diup8kyXHAc/DVL17e8vgg8CAwEAAaOB
+# 9DCB8TAfBgNVHSMEGDAWgBStvZh6NLQm9/rEJlTvA73gJMtUGjAdBgNVHQ4EFgQU
+# U3m/WqorSs9UgOHYm8Cd8rIDZsswDgYDVR0PAQH/BAQDAgGGMA8GA1UdEwEB/wQF
+# MAMBAf8wEQYDVR0gBAowCDAGBgRVHSAAMEQGA1UdHwQ9MDswOaA3oDWGM2h0dHA6
+# Ly9jcmwudXNlcnRydXN0LmNvbS9BZGRUcnVzdEV4dGVybmFsQ0FSb290LmNybDA1
+# BggrBgEFBQcBAQQpMCcwJQYIKwYBBQUHMAGGGWh0dHA6Ly9vY3NwLnVzZXJ0cnVz
+# dC5jb20wDQYJKoZIhvcNAQEMBQADggEBAJNl9jeDlQ9ew4IcH9Z35zyKwKoJ8OkL
+# JvHgwmp1ocd5yblSYMgpEg7wrQPWCcR23+WmgZWnRtqCV6mVksW2jwMibDN3wXsy
+# F24HzloUQToFJBv2FAY7qCUkDrvMKnXduXBBP3zQYzYhBx9G/2CkkeFnvN4ffhkU
+# yWNnkepnB2u0j4vAbkN9w6GAbLIevFOFfdyQoaS8Le9Gclc1Bb+7RrtubTeZtv8j
+# kpHGbkD4jylW6l/VXxRTrPBPYer3IsynVgviuDQfJtl7GQVoP7o81DgGotPmjw7j
+# tHFtQELFhLRAlSv0ZaBIefYdgWOWnU914Ph85I6p0fKtirOMxyHNwu8wggWKMIIE
+# cqADAgECAhAHvfU0ZuEKsr2CCQl/2DeWMA0GCSqGSIb3DQEBCwUAMHwxCzAJBgNV
+# BAYTAkdCMRswGQYDVQQIExJHcmVhdGVyIE1hbmNoZXN0ZXIxEDAOBgNVBAcTB1Nh
+# bGZvcmQxGDAWBgNVBAoTD1NlY3RpZ28gTGltaXRlZDEkMCIGA1UEAxMbU2VjdGln
+# byBSU0EgQ29kZSBTaWduaW5nIENBMB4XDTE5MTExNDAwMDAwMFoXDTIwMTExMzIz
+# NTk1OVowgdoxCzAJBgNVBAYTAkdCMREwDwYDVQQRDAhDRjQ1IDRTTjEWMBQGA1UE
+# CAwNTWlkIEdsYW1vcmdhbjEVMBMGA1UEBwwMTW91bnRhaW4gQXNoMTEwLwYDVQQJ
+# DChWZW50dXJlIEhvdXNlLCBOYXZpZ2F0aW9uIFBhcmsgQWJlcmN5bm9uMSowKAYD
+# VQQKDCFBc3RyaXggSW50ZWdyYXRlZCBTeXN0ZW1zIExpbWl0ZWQxKjAoBgNVBAMM
 # IUFzdHJpeCBJbnRlZ3JhdGVkIFN5c3RlbXMgTGltaXRlZDCCASIwDQYJKoZIhvcN
-# AQEBBQADggEPADCCAQoCggEBAO0miT1vPgd4HI8wZFQZeX/WkRhGW4tJbidMxVUr
-# dEzjohmiAT8U1igUhltAaypUd2em5OWs90lypNEV85Xg9dvfZA+Uz8Jg2YenyV6k
-# Yvfcz6ckzh2A3UudbYVoeLlhj5H5WvvPoiVB0a+pP5p/wEZ8diz125Dii7fpsQNX
-# niE1dIB+6BYCDkBs2NG+5riEyjK2bizO+VE3EBs0H4XAtoAOomFhhd4YuZCTZFvw
-# mGyCWqqYRHoEk9g4iJhpaiqaafjNbtudDUCxlwz+JUX23VMmlZHfM2McIidKGBF5
-# eUzpnlXZBXb3Gw2TI5XXbqHIR6XbIHvo7PthqopmL1nmrSkCAwEAAaOCAbEwggGt
-# MB8GA1UdIwQYMBaAFCmRYP+KTfrr+aZquM/55ku9Sc4SMB0GA1UdDgQWBBQ/9Ss6
-# 0a6UZaeK59pJH7hks1zNyzAOBgNVHQ8BAf8EBAMCB4AwDAYDVR0TAQH/BAIwADAT
-# BgNVHSUEDDAKBggrBgEFBQcDAzARBglghkgBhvhCAQEEBAMCBBAwRgYDVR0gBD8w
-# PTA7BgwrBgEEAbIxAQIBAwIwKzApBggrBgEFBQcCARYdaHR0cHM6Ly9zZWN1cmUu
-# Y29tb2RvLm5ldC9DUFMwQwYDVR0fBDwwOjA4oDagNIYyaHR0cDovL2NybC5jb21v
-# ZG9jYS5jb20vQ09NT0RPUlNBQ29kZVNpZ25pbmdDQS5jcmwwdAYIKwYBBQUHAQEE
-# aDBmMD4GCCsGAQUFBzAChjJodHRwOi8vY3J0LmNvbW9kb2NhLmNvbS9DT01PRE9S
-# U0FDb2RlU2lnbmluZ0NBLmNydDAkBggrBgEFBQcwAYYYaHR0cDovL29jc3AuY29t
-# b2RvY2EuY29tMCIGA1UdEQQbMBmBF2Jlbi5ob29wZXJAYXN0cml4LmNvLnVrMA0G
-# CSqGSIb3DQEBCwUAA4IBAQAo/i6qoDQOLeeuRT1jPRa4FxEgeVIwIxMEOGBhYYq4
-# DGrgcIei1zWNy7/6gAhG07TLxeYUaykMC/iQmwzfXAyfFSyZm6OmHYKZvTiuPE80
-# v+A9FZG17Q2QpAoYpCbnqlUWW/U7QMMIx5s9WXmqCXGzzNX5RgPZ4P5+EdyLytF2
-# LcaOoMwm6IMbalBHZXCxocDmw0C0aU3CiaJp3ThnNwzkrrxB2+8Al+NgilVhN37s
-# DkkZ3UAYesFAmpzToPAxeTCooIRFqCVbKVGFJAowL+GKwUQIPE9St/+MnqcLEwmA
-# BFA//r3ppWICmA7MDk9jR9rz4mb/ErrvMCocccA7wCwsMIIF4DCCA8igAwIBAgIQ
-# LnyHzA6TSlL+lP0ct800rzANBgkqhkiG9w0BAQwFADCBhTELMAkGA1UEBhMCR0Ix
-# GzAZBgNVBAgTEkdyZWF0ZXIgTWFuY2hlc3RlcjEQMA4GA1UEBxMHU2FsZm9yZDEa
-# MBgGA1UEChMRQ09NT0RPIENBIExpbWl0ZWQxKzApBgNVBAMTIkNPTU9ETyBSU0Eg
-# Q2VydGlmaWNhdGlvbiBBdXRob3JpdHkwHhcNMTMwNTA5MDAwMDAwWhcNMjgwNTA4
-# MjM1OTU5WjB9MQswCQYDVQQGEwJHQjEbMBkGA1UECBMSR3JlYXRlciBNYW5jaGVz
-# dGVyMRAwDgYDVQQHEwdTYWxmb3JkMRowGAYDVQQKExFDT01PRE8gQ0EgTGltaXRl
-# ZDEjMCEGA1UEAxMaQ09NT0RPIFJTQSBDb2RlIFNpZ25pbmcgQ0EwggEiMA0GCSqG
-# SIb3DQEBAQUAA4IBDwAwggEKAoIBAQCmmJBjd5E0f4rR3elnMRHrzB79MR2zuWJX
-# P5O8W+OfHiQyESdrvFGRp8+eniWzX4GoGA8dHiAwDvthe4YJs+P9omidHCydv3Lj
-# 5HWg5TUjjsmK7hoMZMfYQqF7tVIDSzqwjiNLS2PgIpQ3e9V5kAoUGFEs5v7BEvAc
-# P2FhCoyi3PbDMKrNKBh1SMF5WgjNu4xVjPfUdpA6M0ZQc5hc9IVKaw+A3V7Wvf2p
-# L8Al9fl4141fEMJEVTyQPDFGy3CuB6kK46/BAW+QGiPiXzjbxghdR7ODQfAuADcU
-# uRKqeZJSzYcPe9hiKaR+ML0btYxytEjy4+gh+V5MYnmLAgaff9ULAgMBAAGjggFR
-# MIIBTTAfBgNVHSMEGDAWgBS7r34CPfqm8TyEjq3uOJjs2TIy1DAdBgNVHQ4EFgQU
-# KZFg/4pN+uv5pmq4z/nmS71JzhIwDgYDVR0PAQH/BAQDAgGGMBIGA1UdEwEB/wQI
-# MAYBAf8CAQAwEwYDVR0lBAwwCgYIKwYBBQUHAwMwEQYDVR0gBAowCDAGBgRVHSAA
-# MEwGA1UdHwRFMEMwQaA/oD2GO2h0dHA6Ly9jcmwuY29tb2RvY2EuY29tL0NPTU9E
-# T1JTQUNlcnRpZmljYXRpb25BdXRob3JpdHkuY3JsMHEGCCsGAQUFBwEBBGUwYzA7
-# BggrBgEFBQcwAoYvaHR0cDovL2NydC5jb21vZG9jYS5jb20vQ09NT0RPUlNBQWRk
-# VHJ1c3RDQS5jcnQwJAYIKwYBBQUHMAGGGGh0dHA6Ly9vY3NwLmNvbW9kb2NhLmNv
-# bTANBgkqhkiG9w0BAQwFAAOCAgEAAj8COcPu+Mo7id4MbU2x8U6ST6/COCwEzMVj
-# EasJY6+rotcCP8xvGcM91hoIlP8l2KmIpysQGuCbsQciGlEcOtTh6Qm/5iR0rx57
-# FjFuI+9UUS1SAuJ1CAVM8bdR4VEAxof2bO4QRHZXavHfWGshqknUfDdOvf+2dVRA
-# GDZXZxHNTwLk/vPa/HUX2+y392UJI0kfQ1eD6n4gd2HITfK7ZU2o94VFB696aSdl
-# kClAi997OlE5jKgfcHmtbUIgos8MbAOMTM1zB5TnWo46BLqioXwfy2M6FafUFRun
-# UkcyqfS/ZEfRqh9TTjIwc8Jvt3iCnVz/RrtrIh2IC/gbqjSm/Iz13X9ljIwxVzHQ
-# NuxHoc/Li6jvHBhYxQZ3ykubUa9MCEp6j+KjUuKOjswm5LLY5TjCqO3GgZw1a6lY
-# YUoKl7RLQrZVnb6Z53BtWfhtKgx/GWBfDJqIbDCsUgmQFhv/K53b0CDKieoofjKO
-# Gd97SDMe12X4rsn4gxSTdn1k0I7OvjV9/3IxTZ+evR5sL6iPDAZQ+4wns3bJ9ObX
-# wzTijIchhmH+v1V04SF3AwpobLvkyanmz1kl63zsRQ55ZmjoIs2475iFTZYRPAmK
-# 0H+8KCgT+2rKVI2SXM3CZZgGns5IW9S1N5NGQXwH3c/6Q++6Z2H/fUnguzB9XIDj
-# 5hY5S6cxggR7MIIEdwIBATCBkjB9MQswCQYDVQQGEwJHQjEbMBkGA1UECBMSR3Jl
-# YXRlciBNYW5jaGVzdGVyMRAwDgYDVQQHEwdTYWxmb3JkMRowGAYDVQQKExFDT01P
-# RE8gQ0EgTGltaXRlZDEjMCEGA1UEAxMaQ09NT0RPIFJTQSBDb2RlIFNpZ25pbmcg
-# Q0ECEQDn707xyENfZNmlutMrdM37MAkGBSsOAwIaBQCgeDAYBgorBgEEAYI3AgEM
-# MQowCKACgAChAoAAMBkGCSqGSIb3DQEJAzEMBgorBgEEAYI3AgEEMBwGCisGAQQB
-# gjcCAQsxDjAMBgorBgEEAYI3AgEVMCMGCSqGSIb3DQEJBDEWBBTDur+JSNOlg26p
-# I5GDZx2YTebugTANBgkqhkiG9w0BAQEFAASCAQBTfz/9MBy271ruvKTjr/nOEIVk
-# y/PBhEjyqeKcMxdArnO4W7s7+74cpvP/+1Nsi1n4I322dfNJ818T94OHrcZ8sRdD
-# fHhQBnEwSDybJiXJ1diUR+Zxig5fy7epU5VMZePCkzSIgwPNI9ogvppUU5ijh9t2
-# 6vYjBDDxCQVHiMGc/1D8TI/FM9WVEY/XpdcOEt/eBQgBWG+juZO6d0Ht83D4PTnl
-# 3MUjb0u+MZtrDfpM29qdoW1ey1lUYlk4Dlw0ZECevAIT8WG7+cI2LdbCXo1N9MCj
-# KNOdshzpDEqLo6pO/aQ6g/KQufdgBDOV2DG1K3NCqxHPMbqS3QbAshr9B+dpoYIC
-# QzCCAj8GCSqGSIb3DQEJBjGCAjAwggIsAgEBMIGpMIGVMQswCQYDVQQGEwJVUzEL
-# MAkGA1UECBMCVVQxFzAVBgNVBAcTDlNhbHQgTGFrZSBDaXR5MR4wHAYDVQQKExVU
-# aGUgVVNFUlRSVVNUIE5ldHdvcmsxITAfBgNVBAsTGGh0dHA6Ly93d3cudXNlcnRy
-# dXN0LmNvbTEdMBsGA1UEAxMUVVROLVVTRVJGaXJzdC1PYmplY3QCDxaI8DklXmOO
-# aRQ5B+YzCzAJBgUrDgMCGgUAoF0wGAYJKoZIhvcNAQkDMQsGCSqGSIb3DQEHATAc
-# BgkqhkiG9w0BCQUxDxcNMTgxMDE1MDk0MzA2WjAjBgkqhkiG9w0BCQQxFgQUskO9
-# kO5pePBioaNNvk0KMDndln4wDQYJKoZIhvcNAQEBBQAEggEAqOlw7VFZllDEFXPd
-# vgAP+XQ9xQ7GZTKMfSVz72e5iMOCFaXuchgUZiq3IhLZXxYfjZ7cgEfJ9qR322Vm
-# fqgUxtY9+rwDoUOs/OnnqZhI9SK34AaFh8Ndq5HJbT3sx39ho9W+ka6yjLH8JaZ1
-# eeM2gJZQ9QCJhnB3kN4DTEvemtmadWkh/cf9PCb7me18u33Q6EXXMWp3sIGjCoAR
-# LpIgYwqJ+/+SKK3Q7rIvLXIA+3HX2b2bJqZ0T8AAs2U3r4Paaazo2FkicRHoUEHb
-# 1CvOqx2eoA3J/we7cs8NWrn9ogKxzC5lFZOTTP6zcDpD5njbompWwG6B/DciSfRI
-# mPj5HA==
+# AQEBBQADggEPADCCAQoCggEBAKGf2ZK/9edFfdkmNy2Cg+j6QkBbrO2c+lrSXEB8
+# +XwIr6RgqSazOksf1Pb49T0dhox4VrUtbBIuyeQnxTrj8rUCx02gmhgNdJqX7mcx
+# VkZWonSKk4FOG4B+Lba/JtedvFpg2ixNuZxDWZXJpGzhge04LYTjJO2WrIbrpJ5P
+# vmUFUXnhjSEKptpKyeptikqD1bUepglUo0dWk99mbD8ufRhjqIrmvCB84UaZiOIx
+# 5dO9J5H+VCrJ15+HzyhS73Ho0kRCXoeMoGpnaiqyzdPARSUOoDGdzvzMkbKP52sL
+# cuLLEKf0UxjveVD/fAfHvAalC+jc7c35rD5m+YDnZpmbvhECAwEAAaOCAacwggGj
+# MB8GA1UdIwQYMBaAFA7hOqhTOjHVir7Bu61nGgOFrTQOMB0GA1UdDgQWBBRa0KqE
+# 4L1d64xMBilKiBhoIp0TzjAOBgNVHQ8BAf8EBAMCB4AwDAYDVR0TAQH/BAIwADAT
+# BgNVHSUEDDAKBggrBgEFBQcDAzARBglghkgBhvhCAQEEBAMCBBAwQAYDVR0gBDkw
+# NzA1BgwrBgEEAbIxAQIBAwIwJTAjBggrBgEFBQcCARYXaHR0cHM6Ly9zZWN0aWdv
+# LmNvbS9DUFMwQwYDVR0fBDwwOjA4oDagNIYyaHR0cDovL2NybC5zZWN0aWdvLmNv
+# bS9TZWN0aWdvUlNBQ29kZVNpZ25pbmdDQS5jcmwwcwYIKwYBBQUHAQEEZzBlMD4G
+# CCsGAQUFBzAChjJodHRwOi8vY3J0LnNlY3RpZ28uY29tL1NlY3RpZ29SU0FDb2Rl
+# U2lnbmluZ0NBLmNydDAjBggrBgEFBQcwAYYXaHR0cDovL29jc3Auc2VjdGlnby5j
+# b20wHwYDVR0RBBgwFoEUc3VwcG9ydEBhc3RyaXguY28udWswDQYJKoZIhvcNAQEL
+# BQADggEBACol7X9UrQLifw8Q+ZH3GoRnBAcEXcb2r1DbiRi7nDOXtmt1p7iZVex8
+# aQz3nTamD429kllUPm5wIYN/sicXKno/lJ6cMYIMxOLF+BAKmsmYs0JOD5qecWHQ
+# gOrWwStAsmVGuNQYnUTlE/IkXMBum5OJzZRXtS9DbaXJInLsFIageSsUpZdpvTYW
+# VCu88Xl0HNOb198NtfB4Y7ZvNE/zLW51uS65Cb5DcNuxLVnlVnYedfumsqWG2jrj
+# ven5mNvLmLSZh/CSZUN84L6S37zm7VcZpPOjMVmecjqOvcXIuqJq9tz/93aYJqwm
+# FjJaFr4gx+PzVrb9GWo70GVe8PtUzhUwggX1MIID3aADAgECAhAdokgwb5smGNCC
+# 4JZ9M9NqMA0GCSqGSIb3DQEBDAUAMIGIMQswCQYDVQQGEwJVUzETMBEGA1UECBMK
+# TmV3IEplcnNleTEUMBIGA1UEBxMLSmVyc2V5IENpdHkxHjAcBgNVBAoTFVRoZSBV
+# U0VSVFJVU1QgTmV0d29yazEuMCwGA1UEAxMlVVNFUlRydXN0IFJTQSBDZXJ0aWZp
+# Y2F0aW9uIEF1dGhvcml0eTAeFw0xODExMDIwMDAwMDBaFw0zMDEyMzEyMzU5NTla
+# MHwxCzAJBgNVBAYTAkdCMRswGQYDVQQIExJHcmVhdGVyIE1hbmNoZXN0ZXIxEDAO
+# BgNVBAcTB1NhbGZvcmQxGDAWBgNVBAoTD1NlY3RpZ28gTGltaXRlZDEkMCIGA1UE
+# AxMbU2VjdGlnbyBSU0EgQ29kZSBTaWduaW5nIENBMIIBIjANBgkqhkiG9w0BAQEF
+# AAOCAQ8AMIIBCgKCAQEAhiKNMoV6GJ9J8JYvYwgeLdx8nxTP4ya2JWYpQIZURnQx
+# YsUQ7bKHJ6aZy5UwwFb1pHXGqQ5QYqVRkRBq4Etirv3w+Bisp//uLjMg+gwZiahs
+# e60Aw2Gh3GllbR9uJ5bXl1GGpvQn5Xxqi5UeW2DVftcWkpwAL2j3l+1qcr44O2Pe
+# j79uTEFdEiAIWeg5zY/S1s8GtFcFtk6hPldrH5i8xGLWGwuNx2YbSp+dgcRyQLXi
+# X+8LRf+jzhemLVWwt7C8VGqdvI1WU8bwunlQSSz3A7n+L2U18iLqLAevRtn5Rhzc
+# jHxxKPP+p8YU3VWRbooRDd8GJJV9D6ehfDrahjVh0wIDAQABo4IBZDCCAWAwHwYD
+# VR0jBBgwFoAUU3m/WqorSs9UgOHYm8Cd8rIDZsswHQYDVR0OBBYEFA7hOqhTOjHV
+# ir7Bu61nGgOFrTQOMA4GA1UdDwEB/wQEAwIBhjASBgNVHRMBAf8ECDAGAQH/AgEA
+# MB0GA1UdJQQWMBQGCCsGAQUFBwMDBggrBgEFBQcDCDARBgNVHSAECjAIMAYGBFUd
+# IAAwUAYDVR0fBEkwRzBFoEOgQYY/aHR0cDovL2NybC51c2VydHJ1c3QuY29tL1VT
+# RVJUcnVzdFJTQUNlcnRpZmljYXRpb25BdXRob3JpdHkuY3JsMHYGCCsGAQUFBwEB
+# BGowaDA/BggrBgEFBQcwAoYzaHR0cDovL2NydC51c2VydHJ1c3QuY29tL1VTRVJU
+# cnVzdFJTQUFkZFRydXN0Q0EuY3J0MCUGCCsGAQUFBzABhhlodHRwOi8vb2NzcC51
+# c2VydHJ1c3QuY29tMA0GCSqGSIb3DQEBDAUAA4ICAQBNY1DtRzRKYaTb3moqjJvx
+# AAAeHWJ7Otcywvaz4GOz+2EAiJobbRAHBE++uOqJeCLrD0bs80ZeQEaJEvQLd1qc
+# KkE6/Nb06+f3FZUzw6GDKLfeL+SU94Uzgy1KQEi/msJPSrGPJPSzgTfTt2SwpiNq
+# WWhSQl//BOvhdGV5CPWpk95rcUCZlrp48bnI4sMIFrGrY1rIFYBtdF5KdX6luMNs
+# tc/fSnmHXMdATWM19jDTz7UKDgsEf6BLrrujpdCEAJM+U100pQA1aWy+nyAlEA0Z
+# +1CQYb45j3qOTfafDh7+B1ESZoMmGUiVzkrJwX/zOgWb+W/fiH/AI57SHkN6RTHB
+# nE2p8FmyWRnoao0pBAJ3fEtLzXC+OrJVWng+vLtvAxAldxU0ivk2zEOS5LpP8WKT
+# KCVXKftRGcehJUBqhFfGsp2xvBwK2nxnfn0u6ShMGH7EezFBcZpLKewLPVdQ0srd
+# /Z4FUeVEeN0B3rF1mA1UJP3wTuPi+IO9crrLPTru8F4XkmhtyGH5pvEqCgulufSe
+# 7pgyBYWe6/mDKdPGLH29OncuizdCoGqC7TtKqpQQpOEN+BfFtlp5MxiS47V1+KHp
+# jgolHuQe8Z9ahyP/n6RRnvs5gBHN27XEp6iAb+VT1ODjosLSWxr6MiYtaldwHDyk
+# WC6j81tLB9wyWfOHpxptWDGCBG8wggRrAgEBMIGQMHwxCzAJBgNVBAYTAkdCMRsw
+# GQYDVQQIExJHcmVhdGVyIE1hbmNoZXN0ZXIxEDAOBgNVBAcTB1NhbGZvcmQxGDAW
+# BgNVBAoTD1NlY3RpZ28gTGltaXRlZDEkMCIGA1UEAxMbU2VjdGlnbyBSU0EgQ29k
+# ZSBTaWduaW5nIENBAhAHvfU0ZuEKsr2CCQl/2DeWMA0GCWCGSAFlAwQCAQUAoIGE
+# MBgGCisGAQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJKoZIhvcNAQkDMQwGCisGAQQB
+# gjcCAQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQBgjcCARUwLwYJKoZIhvcNAQkE
+# MSIEIOqPlO2ADaMbAaFrnb9VrMAbNJnYXcWx9MHmzk/+w5c9MA0GCSqGSIb3DQEB
+# AQUABIIBAA9Cxsl7cILUmmJRl/syPT5l8ioXA7o6f04u+zsGB3MIwu9QA7xatg6G
+# JJ7gal+i/VFB1quOT32HXDZ41VvOMvZL53pnOOXHKOlOLM7clPQFylT0fwrVI+8C
+# UmjRf019KevNpyOeQq/Y05M5dhaE3NXJZqRFCRvAmcEOcoomIyUOQgoSxPu/aJ0V
+# YBUCKMyr6QHS6rTkzG/4XlPaAk7uRjFrn30SC0gNEYFysR9Q1qyH+ou3BR9kDuho
+# 89VDs3aaPxNPslX9+UbjOeSzXWbeK25XTAXs0v3eHafqytOeXMTTDsDpp/VQcXpp
+# umpP8nRWfqQXNu5QTuMFyznn02qWGiqhggIoMIICJAYJKoZIhvcNAQkGMYICFTCC
+# AhECAQEwgY4wejELMAkGA1UEBhMCR0IxGzAZBgNVBAgTEkdyZWF0ZXIgTWFuY2hl
+# c3RlcjEQMA4GA1UEBxMHU2FsZm9yZDEaMBgGA1UEChMRQ09NT0RPIENBIExpbWl0
+# ZWQxIDAeBgNVBAMTF0NPTU9ETyBUaW1lIFN0YW1waW5nIENBAhArc9t0YxFMWlsy
+# SvIwV3JJMAkGBSsOAwIaBQCgXTAYBgkqhkiG9w0BCQMxCwYJKoZIhvcNAQcBMBwG
+# CSqGSIb3DQEJBTEPFw0yMDAzMDYxNDE2MDlaMCMGCSqGSIb3DQEJBDEWBBTIU3zn
+# lQ2qcGz5YN58fnxllEENdDANBgkqhkiG9w0BAQEFAASCAQAyFzt0QgT3e8p5ws88
+# DdG3RmsmguwEjWRGLxmPhfoaYc3vb3RNRAbbi2yXfBWS/zbjtb5GHsCVPOZ/QHZ5
+# di8w8gPfS27tHP95D4YZK7Huzrmp6jC01eJu9YHz4c66ckpiN5T9EgiaxX+8G4Mt
+# F2zucl3YE6jYRofoxZYhVIwfs7F/mHQ0vbrRkkMQmhgrKOuvtmrUd19Nr0eXIfxJ
+# 6Yrq7dVuegksRKuDa9oI/tlknEMr4rTIr4pDcaohAg175X/XdE18hmHbyjvPgvR4
+# P+vxhIX8KjAgextj1J6xGIr00f61gXH10d4FExwF51wb9ka+T+JNnDRS2i03Znzp
+# jCSz
 # SIG # End signature block
